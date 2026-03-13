@@ -1,77 +1,59 @@
 import os
 import requests
+import json
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaFileUpload
 
-# 1. Configuración de datos desde Secrets
+# Configuración
 servidor = "http://reportes.uan.edu.co/jasperserver"
 usuario = os.getenv("UAN_USER")
 clave = os.getenv("UAN_PASS")
 webhook_chat = os.getenv("GOOGLE_CHAT_WEBHOOK")
+gdrive_creds_json = os.getenv("GDRIVE_CREDENTIALS")
 
-# Ruta exacta de tu Jupyter
 ruta_reporte = "REPORTES_UAN/DATOS_POBLACIONALES/DOCENTES/LISTADOS/Materias_y_actividades_de_docentes_detallado"
-formato = "xlsx" 
-parametros = {
-    'ano': '2026',
-    'periodo': '1'
-}
+formato = "xlsx"
 
-def enviar_notificacion_chat(mensaje):
-    if webhook_chat:
-        requests.post(webhook_chat, json={"text": mensaje})
+def subir_a_drive_y_obtener_link(nombre_archivo):
+    # Autenticación con Google Drive
+    creds_dict = json.loads(gdrive_creds_json)
+    creds = service_account.Credentials.from_service_account_info(creds_dict)
+    service = build('drive', 'v3', credentials=creds)
+
+    # Subir archivo
+    metadata = {'name': nombre_archivo}
+    media = MediaFileUpload(nombre_archivo, mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+    file = service.files().create(body=metadata, media_body=media, fields='id, webViewLink').execute()
+    
+    # Dar permiso para que cualquiera con el link lo vea (puedes ajustarlo)
+    service.permissions().create(fileId=file.get('id'), body={'type': 'anyone', 'role': 'viewer'}).execute()
+    
+    return file.get('webViewLink')
 
 def descargar_reporte_uan():
-    if not usuario or not clave:
-        print("❌ Error: Faltan credenciales.")
-        return
-
     sesion = requests.Session()
-    # Mantenemos el disfraz de navegador (indispensable en GitHub)
-    sesion.headers.update({
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
-    })
-
-    # 1. Autenticación (Tal cual tu Jupyter)
-    url_login = f"{servidor}/rest/login"
-    datos_login = {
-        'j_username': usuario,
-        'j_password': clave
-    }
-
+    sesion.headers.update({'User-Agent': 'Mozilla/5.0'})
+    
     try:
-        print(f"Iniciando sesión para {usuario}...")
-        respuesta_login = sesion.post(url_login, data=datos_login)
-        
-        if respuesta_login.status_code == 200:
-            print("✅ Conexión exitosa.")
+        # 1. Login
+        res_login = sesion.post(f"{servidor}/rest/login", data={'j_username': usuario, 'j_password': clave})
+        if res_login.status_code == 200:
+            # 2. Descarga
+            url_desc = f"{servidor}/rest_v2/reports/{ruta_reporte}.{formato}"
+            res_rep = sesion.get(url_desc, params={'ano': '2026', 'periodo': '1'})
             
-            # 2. Descarga (Limpiamos posibles espacios en la ruta)
-            ruta_limpia = ruta_reporte.strip()
-            url_descarga = f"{servidor}/rest_v2/reports/{ruta_limpia}.{formato}"
-            
-            print("Generando Excel... esto puede tardar.")
-            # IMPORTANTE: params=parametros construye el ?ano=2026&periodo=1 automáticamente
-            respuesta_reporte = sesion.get(url_descarga, params=parametros)
-            
-            if respuesta_reporte.status_code == 200:
-                nombre_archivo = f"reporte_docentes_{parametros['ano']}_{parametros['periodo']}.xlsx"
-                with open(nombre_archivo, "wb") as archivo:
-                    archivo.write(respuesta_reporte.content)
+            if res_rep.status_code == 200:
+                nombre = "reporte_uan.xlsx"
+                with open(nombre, "wb") as f:
+                    f.write(res_rep.content)
                 
-                print(f"⭐ ¡Logrado! Archivo guardado.")
-                enviar_notificacion_chat(f"✅ Reporte UAN 2026-1 generado con éxito.")
-            else:
-                # Si vuelve a dar 400, este mensaje en el chat nos dirá POR QUÉ
-                detalle = respuesta_reporte.text[:100]
-                msg = f"❌ Error {respuesta_reporte.status_code} al descargar reporte.\nDetalle: {detalle}"
-                print(msg)
-                enviar_notificacion_chat(msg)
-        else:
-            print(f"❌ Error de acceso: Status {respuesta_login.status_code}")
-            enviar_notificacion_chat("❌ Error de acceso: Revisa credenciales en los Secrets.")
-            
+                # 3. Subir a Drive y enviar Link al Chat
+                link = subir_a_drive_y_obtener_link(nombre)
+                requests.post(webhook_chat, json={"text": f"✅ Reporte listo! Descárgalo aquí: {link}"})
+                print("Proceso completo.")
     except Exception as e:
-        print(f"⚠️ Error: {e}")
-        enviar_notificacion_chat(f"⚠️ Error de red: {e}")
+        requests.post(webhook_chat, json={"text": f"⚠️ Error: {e}"})
 
 if __name__ == "__main__":
     descargar_reporte_uan()
